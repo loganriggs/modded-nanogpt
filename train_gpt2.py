@@ -5,6 +5,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import glob
 import time
+import argparse
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,6 +15,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+import wandb
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -193,21 +195,49 @@ class MLP(nn.Module):
         self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-
+        self.config = config
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        if self.config.squared_mlp:
+            x = x.square()
+        else:
+            x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
+
+
+class Bilinear(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        expansion_factor = config.expansion_factor
+        self.Left  = CastedLinear(config.n_embd, expansion_factor* config.n_embd, bias=False)
+        self.Right  = CastedLinear(config.n_embd, expansion_factor* config.n_embd, bias=False)
+        self.Down  = CastedLinear(expansion_factor* config.n_embd, config.n_embd, bias=False)
+        self.Down_bias = nn.Parameter(torch.zeros(config.n_embd))
+        self.Down.weight.data.zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x):
+        if(self.config.gated):
+            x = F.silu(self.Left(x))*self.Right(x)
+        else:
+            x = self.Left(x)*self.Right(x)
+        x = self.Down(x) + self.Down_bias
+        return x
+
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.mlp = MLP(config)
+        if config.bilinear:
+            self.mlp = Bilinear(config)
+        else:
+            self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
-
+        self.config = config
     def forward(self, x, v1, x0):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
@@ -221,9 +251,17 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 50304
-    n_layer : int = 12
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
-    n_embd : int = 768
+    n_layer : int = 18
+    n_head : int = 9  # head dim 128 suggested by @Grad62304977
+    n_embd : int = 1152
+    # n_layer : int = 12
+    # n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    # n_embd : int = 768
+    squared_mlp : bool = False
+    bilinear : bool = False
+    expansion_factor : int = 4
+    gated : bool = False
+    squared_attn : bool = False
 
 class GPT(nn.Module):
 
@@ -341,15 +379,24 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
-    sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3242 # number of iterations to run
+    sequence_length : int = 512 # sequence length, in tokens
+    num_iterations : int = 3242*16 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Train GPT-2 with various configurations')
+parser.add_argument('--squared_mlp', action='store_true', help='Use squared MLP activation')
+parser.add_argument('--bilinear', action='store_true', help='Use bilinear MLP')
+parser.add_argument('--gated', action='store_true', help='Use gated activation')
+parser.add_argument('--squared_attn', action='store_true', help='Use squared attention')
+cmd_args = parser.parse_args()
+
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -383,7 +430,16 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(
+    vocab_size=num_vocab,
+    n_layer=16,
+    n_head=8,
+    n_embd=1024,
+    squared_mlp=cmd_args.squared_mlp,
+    bilinear=cmd_args.bilinear,
+    gated=cmd_args.gated,
+    squared_attn=cmd_args.squared_attn
+))
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -445,6 +501,46 @@ if master_process:
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
+    
+    if not model.module.config.bilinear:
+        if model.module.config.squared_mlp:
+            prefix = "mlp^2_"
+        else:
+            prefix = "mlpReLU^2_"
+    else:
+        if model.module.config.gated:
+            prefix = "swiglu_"
+        else:
+            prefix = "bilinear_"
+    if model.module.config.squared_attn:
+        prefix += "sqrd_attn_"
+    else:
+        prefix += "softmax_"
+    
+    run_id = f'gpt2_{prefix}_expf{model.module.config.expansion_factor}_l{model.module.config.n_layer}_nhead{model.module.config.n_head}_embd{model.module.config.n_embd}'
+    # Initialize wan
+    # initialize wandb
+    wandb.init(
+        project="modded_nanogpt_b49f25f",
+        name=run_id,
+        config={
+            "batch_size": args.batch_size,
+            "device_batch_size": args.device_batch_size,
+            "sequence_length": args.sequence_length,
+            "num_iterations": args.num_iterations,
+            "warmup_iters": args.warmup_iters,
+            "warmdown_iters": args.warmdown_iters,
+            "weight_decay": args.weight_decay,
+            "model_n_layer": model.module.config.n_layer,
+            "model_n_head": model.module.config.n_head,
+            "model_n_embd": model.module.config.n_embd,
+            "squared_mlp": model.module.config.squared_mlp,
+            "bilinear": model.module.config.bilinear,
+            "gated": model.module.config.gated,
+            "squared_attn": model.module.config.squared_attn,
+            "expansion_factor": model.module.config.expansion_factor,
+        }
+    )
 
 training_time_ms = 0
 # start the clock
@@ -482,6 +578,12 @@ for step in range(args.num_iterations + 1):
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            # log to wandb
+            wandb.log({
+                "val_loss": val_loss.item(),
+                "train_time_ms": training_time_ms,
+                "step_avg_ms": training_time_ms/(timed_steps-1) if timed_steps > 1 else 0,
+            }, step=step)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -538,9 +640,15 @@ for step in range(args.num_iterations + 1):
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+        # log to wandb every 100 steps
+        if (step + 1) % 100 == 0:
+            wandb.log({
+                "train_loss": train_loss.item(),
+            }, step=step+1)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    wandb.finish()
 
 # -------------------------------------------------------------------------
 # clean up nice
