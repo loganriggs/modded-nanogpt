@@ -251,9 +251,9 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 50304
-    n_layer : int = 18
-    n_head : int = 9  # head dim 128 suggested by @Grad62304977
-    n_embd : int = 1152
+    n_layer : int = 12
+    n_head : int = 6  # head dim 128 suggested by @Grad62304977
+    n_embd : int = 768
     # n_layer : int = 12
     # n_head : int = 6 # head dim 128 suggested by @Grad62304977
     # n_embd : int = 768
@@ -380,7 +380,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 512 # sequence length, in tokens
-    num_iterations : int = 3242*16 # number of iterations to run
+    num_iterations : int = 3242*8 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
@@ -430,11 +430,12 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
+setting="small"
 model = GPT(GPTConfig(
     vocab_size=num_vocab,
-    n_layer=16,
-    n_head=8,
-    n_embd=1024,
+    n_layer=12 if setting=="small" else 16,
+    n_head=6 if setting=="small" else 8,
+    n_embd=768 if setting=="small" else 1024,
     squared_mlp=cmd_args.squared_mlp,
     bilinear=cmd_args.bilinear,
     gated=cmd_args.gated,
@@ -579,10 +580,12 @@ for step in range(args.num_iterations + 1):
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
             # log to wandb
+            tokens_trained_millions = (step * args.batch_size * args.sequence_length) / 1_000_000
             wandb.log({
                 "val_loss": val_loss.item(),
                 "train_time_ms": training_time_ms,
                 "step_avg_ms": training_time_ms/(timed_steps-1) if timed_steps > 1 else 0,
+                "tokens_trained_millions": tokens_trained_millions,
             }, step=step)
         # start the clock again
         torch.cuda.synchronize()
@@ -642,8 +645,10 @@ for step in range(args.num_iterations + 1):
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
         # log to wandb every 100 steps
         if (step + 1) % 100 == 0:
+            tokens_trained_millions = ((step + 1) * args.batch_size * args.sequence_length) / 1_000_000
             wandb.log({
                 "train_loss": train_loss.item(),
+                "tokens_trained_millions": tokens_trained_millions,
             }, step=step+1)
 
 if master_process:
