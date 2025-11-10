@@ -401,7 +401,6 @@ class DistributedDataLoader:
 # int main
 
 
-#TODO: change seq len, num iteratiosn, and warmdown iters. We do this after our initial debugging.
 @dataclass
 class Hyperparameters:
     # data hyperparams
@@ -410,13 +409,10 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
-    sequence_length : int = 64 # sequence length, in tokens
-    # sequence_length : int = 1024 # sequence length, in tokens
-    # num_iterations : int = 3242*3 # number of iterations to run
-    num_iterations : int = 500 # number of iterations to run
+    sequence_length : int = 1024 # sequence length, in tokens
+    num_iterations : int = 3242*3 # number of iterations to run
     warmup_iters : int = 0
-    # warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
-    warmdown_iters : int = 100 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
@@ -466,8 +462,6 @@ if __name__ == "__main__":
     # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
     # this originates from Karpathy's experiments.
     num_vocab = 50304
-    # setting="small"
-    setting="debug"
     debug_setting = {
         "n_layer": 2,
         "n_head": 4,
