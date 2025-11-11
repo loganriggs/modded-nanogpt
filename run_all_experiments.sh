@@ -52,10 +52,24 @@ echo "Total experiments: ${#EXPERIMENTS[@]}"
 echo "Each experiment will use all 8 GPUs via DDP"
 echo ""
 
+# Check for upload flag and HF_USERNAME early
+UPLOAD_MODELS=false
+if [ "$1" == "--upload" ]; then
+    UPLOAD_MODELS=true
+    if [ -z "$HF_USERNAME" ]; then
+        echo "ERROR: HF_USERNAME environment variable not set"
+        echo "Set it with: export HF_USERNAME=your-username"
+        exit 1
+    fi
+    echo "Will upload models to HuggingFace after each experiment completes"
+    echo ""
+fi
+
 # Track experiment results
 SUCCESSFUL=0
 FAILED=0
 FAILED_EXPERIMENTS=()
+UPLOADED=0
 
 # Run experiments sequentially
 for ((i=0; i<${#EXPERIMENTS[@]}; i++)); do
@@ -80,6 +94,31 @@ for ((i=0; i<${#EXPERIMENTS[@]}; i++)); do
     if bash run.sh --setting "$size_setting" $arch_flags > "$log_file" 2>&1; then
         echo "✓ SUCCESS: $exp_name"
         ((SUCCESSFUL++))
+
+        # Upload to HuggingFace if requested
+        if [ "$UPLOAD_MODELS" = true ]; then
+            echo ""
+            echo "Uploading $exp_name to HuggingFace..."
+
+            # Find the checkpoint file for this experiment
+            checkpoint=$(find logs/gpt2_* -name "state_step*.pt" -newer "$log_file" 2>/dev/null | head -1)
+
+            if [ -n "$checkpoint" ]; then
+                # Extract run name from checkpoint path
+                run_name=$(basename $(dirname "$checkpoint"))
+                repo_id="${HF_USERNAME}/${run_name}"
+
+                if python upload_to_hf.py --checkpoint "$checkpoint" --repo_id "$repo_id"; then
+                    echo "✓ Uploaded: $run_name to https://huggingface.co/$repo_id"
+                    ((UPLOADED++))
+                else
+                    echo "✗ Failed to upload: $run_name"
+                fi
+            else
+                echo "⚠ Warning: No checkpoint found for $exp_name"
+            fi
+            echo ""
+        fi
     else
         echo "✗ FAILED: $exp_name (exit code: $?)"
         ((FAILED++))
@@ -88,6 +127,9 @@ for ((i=0; i<${#EXPERIMENTS[@]}; i++)); do
 
     echo "Completed at: $(date)"
     echo "Progress: $((i+1))/${#EXPERIMENTS[@]} | Success: $SUCCESSFUL | Failed: $FAILED"
+    if [ "$UPLOAD_MODELS" = true ]; then
+        echo "Uploaded: $UPLOADED"
+    fi
 done
 
 echo ""
@@ -97,6 +139,9 @@ echo "=========================================="
 echo "Total: ${#EXPERIMENTS[@]} experiments"
 echo "Successful: $SUCCESSFUL"
 echo "Failed: $FAILED"
+if [ "$UPLOAD_MODELS" = true ]; then
+    echo "Uploaded to HuggingFace: $UPLOADED"
+fi
 echo ""
 
 if [ $FAILED -gt 0 ]; then
@@ -111,42 +156,6 @@ fi
 echo "Log files created:"
 ls -lh logs/run_*.log 2>/dev/null || echo "No log files found"
 echo ""
-
-# Optional: Upload models to HuggingFace
-if [ "$1" == "--upload" ]; then
-    echo ""
-    echo "=========================================="
-    echo "Uploading models to HuggingFace..."
-    echo "=========================================="
-
-    if [ -z "$HF_USERNAME" ]; then
-        echo "ERROR: HF_USERNAME environment variable not set"
-        echo "Set it with: export HF_USERNAME=your-username"
-        exit 1
-    fi
-
-    # Find all checkpoint files
-    uploaded=0
-    for checkpoint in logs/gpt2_*/state_step*.pt; do
-        if [ -f "$checkpoint" ]; then
-            # Extract run name from path
-            run_name=$(basename $(dirname "$checkpoint"))
-            repo_id="${HF_USERNAME}/${run_name}"
-
-            echo ""
-            echo "Uploading $checkpoint to $repo_id"
-            if python upload_to_hf.py --checkpoint "$checkpoint" --repo_id "$repo_id"; then
-                echo "✓ Uploaded: $run_name"
-                ((uploaded++))
-            else
-                echo "✗ Failed to upload: $run_name"
-            fi
-        fi
-    done
-
-    echo ""
-    echo "Upload complete: $uploaded models uploaded"
-fi
 
 echo ""
 echo "Done!"
