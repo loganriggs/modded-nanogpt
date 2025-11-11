@@ -1,6 +1,7 @@
 numpy
 tqdm
-torch
+torch==2.8.0
+triton==3.4.0
 huggingface-hub
 wandb
 transformers
