@@ -16,7 +16,7 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
-
+from einops import einsum
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -185,39 +185,25 @@ class CausalSelfAttention(nn.Module):
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         if(self.squared_attn):
-            y = naive_squared_attention(q, k, v)
+            y = self.naive_squared_attention(q, k, v)
         else:
             y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
 
-import math
-def naive_squared_attention(q, k, v):
-    """Fixed version with consistent shapes"""
-    # Input: q, k, v are [B, T, H, D]
-    # Transpose to [B, H, T, D] for matmul
-    q = q.transpose(1, 2)  # [B, H, T, D]
-    k = k.transpose(1, 2)  # [B, H, T, D]
-    v = v.transpose(1, 2)  # [B, H, T, D]
-    
-    B, H, T, D = q.shape
-    
-    # Now matmul works correctly
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)  # [B, H, T, T]
-    pattern = scores.square()
-    
-    # Causal mask
-    causal_mask = torch.tril(torch.ones(T, T, device=pattern.device, dtype=torch.bool))
-    pattern = pattern.masked_fill(~causal_mask, 0.0)
-    
-    # Normalize (recommended!)
-    pattern = pattern / (pattern.sum(dim=-1, keepdim=True) + 1e-8)
-    
-    # Apply to values
-    z = torch.matmul(pattern, v)  # [B, H, T, D]
-    
-    return z  # Already in correct shape!
+    def naive_squared_attention(self, q, k, v):
+        B, T, H, D = q.shape # B: batch size, T: sequence length, H: number of heads, D: dimension of each head
+        # 64, 1024, 6, 64
+        scores = einsum(q, k, "... seq_q n_head d_head, ... seq_k n_head d_head -> ... n_head seq_q seq_k")
+
+        pattern = (scores / D).square()
+        causal_mask = torch.tril(torch.ones(T, T, device=pattern.device, dtype=torch.bool))
+        pattern.masked_fill_(causal_mask.logical_not(), 0.0)
+
+        z = einsum(pattern, v, "... n_head seq_q seq_k, ... seq_k n_head d_head -> ... n_head seq_q d_head")
+        return z
+
 
 class MLP(nn.Module):
 
@@ -408,14 +394,14 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 3242*3 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 250 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 
@@ -481,6 +467,12 @@ if __name__ == "__main__":
         "n_embd": 1280,
         "bilinear": False,
     }
+    # medium_setting = {
+    #     "n_layer": 20,
+    #     "n_head": 10,
+    #     "n_embd": 1280,
+    #     "bilinear": False,
+    # }
     large_setting = {
         "n_layer": 26,
         "n_head": 13,
