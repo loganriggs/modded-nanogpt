@@ -269,8 +269,6 @@ class CausalBilinearSelfAttention(nn.Module):
         causal_mask = torch.tril(torch.ones(T, T, device=scores.device, dtype=torch.bool))
         scores.masked_fill_(causal_mask.logical_not(), float('-inf'))
         scores2.masked_fill_(causal_mask.logical_not(), float('-inf'))
-        # pattern = (scores / D) - (scores2 / D)
-        # Add softmax to both
         pattern = F.softmax(scores / D, dim=-1) - self.bilinear_lamb*F.softmax(scores2 / D, dim=-1)
         z = einsum(pattern, v, "... n_head seq_q seq_k, ... seq_k n_head d_head -> ... n_head seq_q d_head")
         return z
@@ -468,14 +466,14 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 32 # batch size, in sequences, per device
+    device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     # sequence_length : int = 512 # sequence length, in tokens
-    num_iterations : int = 3242*2 # number of iterations to run
-    # num_iterations : int = 3242*3 # number of iterations to run
+    # num_iterations : int = 3242*2 # number of iterations to run
+    num_iterations : int = 3242*3 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
-    # warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    # warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
