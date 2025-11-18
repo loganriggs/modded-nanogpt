@@ -204,6 +204,76 @@ class CausalSelfAttention(nn.Module):
         z = einsum(pattern, v, "... n_head seq_q seq_k, ... seq_k n_head d_head -> ... n_head seq_q d_head")
         return z
 
+class CausalBilinearSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        self.squared_attn = config.squared_attn
+        assert self.n_embd % self.n_head == 0
+        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_q2 = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_k2 = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        # output projection
+        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.rotary = Rotary(self.head_dim)
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        if(config.bilinear_attn and not config.squared_attn):
+            self.bilinear_lamb = nn.Parameter(torch.tensor(0.8))
+
+    def forward(self, x, v1=None):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        q2 = self.c_q2(x).view(B, T, self.n_head, self.head_dim)
+        k2 = self.c_k2(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        if v1 is None:
+            v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        cos, sin = self.rotary(q)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q2, k2 = F.rms_norm(q2, (q2.size(-1),)), F.rms_norm(k2, (k2.size(-1),)) # QK norm suggested by @Grad62304977
+        q2, k2 = apply_rotary_emb(q2, cos, sin), apply_rotary_emb(k2, cos, sin)
+        if(self.squared_attn):
+            y = self.squared_attention(q, k, v, q2, k2)
+        else:
+            y = self.differential_attention(q, k, v, q2, k2)
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y, v1
+
+    def squared_attention(self, q, k, v, q2, k2):
+        B, T, H, D = q.shape # B: batch size, T: sequence length, H: number of heads, D: dimension of each head
+        # 64, 1024, 6, 64
+        scores = einsum(q, k, "... seq_q n_head d_head, ... seq_k n_head d_head -> ... n_head seq_q seq_k")
+        scores2 = einsum(q2, k2, "... seq_q2 n_head d_head2, ... seq_k2 n_head d_head2 -> ... n_head seq_q2 seq_k2")
+        pattern = (scores / D) * (scores2 / D)
+        causal_mask = torch.tril(torch.ones(T, T, device=pattern.device, dtype=torch.bool))
+        pattern.masked_fill_(causal_mask.logical_not(), 0.0)
+
+        z = einsum(pattern, v, "... n_head seq_q seq_k, ... seq_k n_head d_head -> ... n_head seq_q d_head")
+        return z
+    
+    def differential_attention(self, q, k, v, q2, k2):
+        B, T, H, D = q.shape # B: batch size, T: sequence length, H: number of heads, D: dimension of each head
+        # 64, 1024, 6, 64
+        scores = einsum(q, k, "... seq_q n_head d_head, ... seq_k n_head d_head -> ... n_head seq_q seq_k")
+        scores2 = einsum(q2, k2, "... seq_q2 n_head d_head2, ... seq_k2 n_head d_head2 -> ... n_head seq_q2 seq_k2")
+        causal_mask = torch.tril(torch.ones(T, T, device=scores.device, dtype=torch.bool))
+        scores.masked_fill_(causal_mask.logical_not(), float('-inf'))
+        scores2.masked_fill_(causal_mask.logical_not(), float('-inf'))
+        # pattern = (scores / D) - (scores2 / D)
+        # Add softmax to both
+        pattern = F.softmax(scores / D, dim=-1) - self.bilinear_lamb*F.softmax(scores2 / D, dim=-1)
+        z = einsum(pattern, v, "... n_head seq_q seq_k, ... seq_k n_head d_head -> ... n_head seq_q d_head")
+        return z
 
 class MLP(nn.Module):
 
@@ -249,7 +319,10 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
+        if config.bilinear_attn:
+            self.attn = CausalBilinearSelfAttention(config)
+        else:
+            self.attn = CausalSelfAttention(config)
         if config.bilinear:
             self.mlp = Bilinear(config)
         else:
@@ -277,6 +350,7 @@ class GPTConfig:
     expansion_factor : int = 4
     gated : bool = False
     squared_attn : bool = False
+    bilinear_attn : bool = False
 
 class GPT(nn.Module):
 
@@ -396,9 +470,12 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3242*3 # number of iterations to run
+    # sequence_length : int = 512 # sequence length, in tokens
+    num_iterations : int = 3242*2 # number of iterations to run
+    # num_iterations : int = 3242*3 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    # warmdown_iters : int = 926*4 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -413,6 +490,7 @@ if __name__ == "__main__":
     parser.add_argument('--gated', action='store_true', help='Use gated activation')
     parser.add_argument('--squared_attn', action='store_true', help='Use squared attention')
     parser.add_argument('--setting', type=str, default='debug', choices=['debug', 'small', 'medium', 'large', 'bilinear_small', 'bilinear_medium', 'bilinear_large'], help='Model size setting')
+    parser.add_argument('--bilinear_attn', action='store_true', help='Use bilinear attention')
     cmd_args = parser.parse_args()
 
     args = Hyperparameters()
@@ -449,11 +527,17 @@ if __name__ == "__main__":
     # this originates from Karpathy's experiments.
     num_vocab = 50304
     debug_setting = {
-        "n_layer": 2,
+        "n_layer": 6,
         "n_head": 4,
-        "n_embd": 64,
+        "n_embd": 256,
         "bilinear": False,
     }
+    # debug_setting = {
+    #     "n_layer": 2,
+    #     "n_head": 4,
+    #     "n_embd": 64,
+    #     "bilinear": False,
+    # }
 
     small_setting = {
         "n_layer": 12,
@@ -518,7 +602,8 @@ if __name__ == "__main__":
         squared_mlp=cmd_args.squared_mlp,
         bilinear=cmd_args.bilinear,
         gated=cmd_args.gated,
-        squared_attn=cmd_args.squared_attn
+        squared_attn=cmd_args.squared_attn,
+        bilinear_attn=cmd_args.bilinear_attn,
     ))
     model = model.cuda().bfloat16()
     for m in model.modules():
@@ -597,7 +682,7 @@ if __name__ == "__main__":
         else:
             prefix += "softmax_"
     
-        run_id = f'gpt2_{prefix}_expf{model.module.config.expansion_factor}_l{model.module.config.n_layer}_nhead{model.module.config.n_head}_embd{model.module.config.n_embd}_seq{args.sequence_length}'
+        run_id = f'gpt2_{prefix}_expf{model.module.config.expansion_factor}bi_attn{model.module.config.bilinear_attn}_l{model.module.config.n_layer}_nhead{model.module.config.n_head}_embd{model.module.config.n_embd}_seq{args.sequence_length}'
         # Initialize wan
         # initialize wandb
         wandb.init(
@@ -618,6 +703,7 @@ if __name__ == "__main__":
                 "bilinear": model.module.config.bilinear,
                 "gated": model.module.config.gated,
                 "squared_attn": model.module.config.squared_attn,
+                "bilinear_attn": model.module.config.bilinear_attn,
                 "expansion_factor": model.module.config.expansion_factor,
             }
         )
